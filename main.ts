@@ -95,6 +95,8 @@ const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** Cooldown duration after a 429, in milliseconds (60 seconds). */
 const COOLDOWN_MS = 60_000;
+/** Base delay between failover attempts, in milliseconds. */
+const FAILOVER_BASE_DELAY_MS = 100;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -237,6 +239,11 @@ function isClientError(status: number): boolean {
   return status >= 400 && status < 500 && status !== 429;
 }
 
+/** Sleep for a given number of milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Try to serve a request with failover across eligible models.
  * Returns the successful response or null if all models failed.
@@ -254,12 +261,14 @@ async function serveWithFailover(
   const models = eligibleModels(requires);
   const trail: Array<{ status: number; code: string; model: string | null }> = [];
 
-  for (const model of models) {
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
     let upstream: Response;
     try {
       upstream = await dial(model.id, translate(body, model.id));
     } catch (err) {
       trail.push({ status: 0, code: 'network_error', model: model.id });
+      if (i + 1 < models.length) await sleep(FAILOVER_BASE_DELAY_MS);
       continue;
     }
 
@@ -282,6 +291,7 @@ async function serveWithFailover(
       }
 
       if (isRetryableError(status) || isClientError(status)) {
+        if (i + 1 < models.length) await sleep(FAILOVER_BASE_DELAY_MS);
         continue;
       }
       continue;
