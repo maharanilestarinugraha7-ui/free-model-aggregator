@@ -1,43 +1,58 @@
-// The brief's two documents, the free model list, and the catalog.
-//
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the
-// prose around them does not matter: this file finds each by its `schema` member, under this contest's
-// prefix (`free-model-aggregator-02/`).
-//
-//   - the free model list (`free-model-aggregator-02/models/v1`): one row a model, keyed by the id the
-//     gateway routes (`openrouter/<vendor>/<model>:free`), with the model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
-//     free model may serve a prompt; this baseline never routes a paid one.
-//   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
-//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its weight
-//     (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
-//     this baseline routes each arrival by its row, which is why the prompt list is read before the
-//     first request.
-//
-// A brief may spell the model list `models` or `ratings` and the prompts `prompts` or `manifest` (the
-// sibling -01 contest's names), and one document may carry both; a document is found by the arrays it
-// carries, never by a name alone. The brief's own prose is never parsed.
-//
-// Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
-// register body build the same document, byte for byte, on a live pass and on its replay.
-//
-// The 14 free models in the brief's catalog, each with its gateway id, parameter count (where known),
-// and quality rating in milli-points (0-2000, higher is stronger). These are the exact ids that must
-// appear in the register body and in GET /v1/models on both auth headers.
-//   - openrouter/baidu/ernie-5.5-flash-preview:free          // ~1M ctx, tools, JSON;       rating 1150
-//   - openrouter/cohere/north-mini-code:free                 // 256k ctx, tools;             rating 1200
-//   - openrouter/dots-studio/dots-3-note-preview:free        // 512k ctx, tools, vision, JSON; rating 1150
-//   - openrouter/google/gemma-4-26b-a4b-it:free              // 262k ctx, tools, vision, JSON; rating 1150
-//   - openrouter/google/gemma-4-31b-it:free                  // 262k ctx, tools, vision, JSON; rating 1210
-//   - openrouter/inclusionai/ling-3.2-flash:free             // 1M ctx, tools, vision, JSON;   rating 1150
-//   - openrouter/liquid/lfm-3-1.7b:free                      // 262k ctx, tools, JSON;       rating 1150
-//   - openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free // 256k ctx, tools, vision; rating 1150
-//   - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free      // 1M ctx, tools;               rating 1285
-//   - openrouter/nvidia/nemotron-3.5-lightning:free          // 1M ctx, tools;               rating 1221
-//   - openrouter/nvidia/nemotron-3.5-super-vl:free           // 1M ctx, tools, vision, JSON;   rating 1303
-//   - openrouter/particle-ai/particle-1:free                 // 1M ctx, tools, vision, JSON;   rating 1150
-//   - openrouter/recursive/flint-v1.0:free                   // 262k ctx, tools, JSON;       rating 1150
-//   - openrouter/thinkingmachines/inkling-2-small:free       // 1M ctx, tools, vision;         rating 1475
+/**
+ * The provider catalog is the single source of truth for which free models this entry advertises
+ * and serves. It is emitted by `--list`, posted to `/register` on trial start, and mirrored by
+ * GET /v1/models under both authorization headers; the gateway verifies byte-for-byte equality
+ * between the registered catalog and the live /v1/models response, so any divergence loses the
+ * column immediately. The catalog must contain exactly the fourteen free models the brief scores,
+ * no more and no fewer, because the scoring column counts each dialable id once.
+ *
+ * Rating_milli ordering matters for failover: when multiple eligible models satisfy a prompt's
+ * requirements, main.ts ranks them by descending rating_milli and tries them in that order. A
+ * higher-rated model is attempted first; if it errors or times out, the next-highest is tried.
+ * This deterministic ranking means the same model sequence is used on the live pass and on replay,
+ * so failover behavior is reproducible and the register body matches byte for byte.
+ *
+ * The brief's two documents, the free model list, and the catalog.
+ *
+ * A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the
+ * prose around them does not matter: this file finds each by its `schema` member, under this contest's
+ * prefix (`free-model-aggregator-02/`).
+ *
+ *   - the free model list (`free-model-aggregator-02/models/v1`): one row a model, keyed by the id the
+ *     gateway routes (`openrouter/<vendor>/<model>:free`), with the model's public rating in
+ *     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
+ *     free model may serve a prompt; this baseline never routes a paid one.
+ *   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
+ *     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its weight
+ *     (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
+ *     this baseline routes each arrival by its row, which is why the prompt list is read before the
+ *     first request.
+ *
+ * A brief may spell the model list `models` or `ratings` and the prompts `prompts` or `manifest` (the
+ * sibling -01 contest's names), and one document may carry both; a document is found by the arrays it
+ * carries, never by a name alone. The brief's own prose is never parsed.
+ *
+ * Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
+ * register body build the same document, byte for byte, on a live pass and on its replay.
+ *
+ * The 14 free models in the brief's catalog, each with its gateway id, parameter count (where known),
+ * and quality rating in milli-points (0-2000, higher is stronger). These are the exact ids that must
+ * appear in the register body and in GET /v1/models on both auth headers.
+ */
+// openrouter/baidu/ernie-5.5-flash-preview:free — ~1M context, tools, JSON; rating 1150
+// openrouter/cohere/north-mini-code:free — 256k context, tools; rating 1200
+// openrouter/dots-studio/dots-3-note-preview:free — 512k context, tools, vision, JSON; rating 1150
+// openrouter/google/gemma-4-26b-a4b-it:free — 262k context, tools, vision, JSON; rating 1150
+// openrouter/google/gemma-4-31b-it:free — 262k context, tools, vision, JSON; rating 1210
+// openrouter/inclusionai/ling-3.2-flash:free — 1M context, tools, vision, JSON; rating 1150
+// openrouter/liquid/lfm-3-1.7b:free — 262k context, tools, JSON; rating 1150
+// openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free — 256k context, tools, vision; rating 1150
+// openrouter/nvidia/nemotron-3-ultra-550b-a55b:free — 1M context, tools; rating 1285
+// openrouter/nvidia/nemotron-3.5-lightning:free — 1M context, tools; rating 1221
+// openrouter/nvidia/nemotron-3.5-super-vl:free — 1M context, tools, vision, JSON; rating 1303
+// openrouter/particle-ai/particle-1:free — 1M context, tools, vision, JSON; rating 1150
+// openrouter/recursive/flint-v1.0:free — 262k context, tools, JSON; rating 1150
+// openrouter/thinkingmachines/inkling-2-small:free — 1M context, tools, vision; rating 1475
 
 import { readFileSync } from 'node:fs';
 
@@ -292,9 +307,15 @@ export function capabilitiesOf(model: ModelRow): Capabilities {
 }
 
 /**
- * Test whether a model's capabilities meet one prompt's requirements. An unknown capability (null)
- * never meets a required one. Checks tools, vision, JSON mode, and minimum context length.
- * This is the gate that filters the free model pool before ranking by rating_milli.
+ * Requirement matching gate: a model is eligible for a prompt only if it satisfies every
+ * declared requirement. The brief's Requirement object may specify tools, vision, JSON mode,
+ * and a minimum context length. For each required capability, the model must explicitly
+ * declare support (true); a null value in the brief means "unknown" and never satisfies a
+ * required flag. Minimum context is checked against the model's declared context_length;
+ * if the model's context is null or below the threshold, it is rejected. This function is
+ * the filter that runs before ranking: only models passing this gate are then ordered by
+ * descending rating_milli for failover attempts. The logic is pure and deterministic so
+ * that live and replay eligibility decisions are identical.
  */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
   if (requires.tools === true && caps.tools !== true) return false;
@@ -318,6 +339,7 @@ export function buildCatalog(brief: Brief): CatalogReport {
   const seen = new Set<string>();
   const models: CatalogModel[] = [];
   for (const model of brief.models) {
+    // Skip non-free models and deduplicate by gateway id
     if (!model.free || seen.has(model.id)) continue;
     seen.add(model.id);
     models.push({ id: model.id, free: true, context_length: model.context_length });
