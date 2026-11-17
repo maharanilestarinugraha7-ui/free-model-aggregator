@@ -31,6 +31,23 @@
 //   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the
 //   register body's catalog is that same document, byte for byte.
 //
+// SERVER ARCHITECTURE
+//   The server is a single Node HTTP server (node:http) with async request handlers. Request flow:
+//     - Incoming request -> handle() routes by method+path:
+//         GET /v1/models          -> models()  (responds in OpenAI or Anthropic shape per auth header)
+//         POST /v1/chat/completions -> chat()    (OpenAI wire, failover across eligible models)
+//         POST /v1/messages       -> messages() (Anthropic wire, translated to OpenAI upstream, failover)
+//         *                       -> 404
+//     - chat() and messages() both call serveWithFailover() which:
+//         1. Computes eligible models for the prompt's requirements (meetsRequirements + not cooling down)
+//         2. Sorts eligible models by rating_milli DESC (quality: highest-rated first)
+//         3. Iterates models, calling dial() for each until one succeeds or all exhausted
+//         4. On 429: records per-model cooldown (COOLDOWN_MS), skips model on subsequent prompts
+//         5. On 4xx/5xx (except 429): tries next model after FAILOVER_BASE_DELAY_MS
+//         6. On network error: tries next model after FAILOVER_BASE_DELAY_MS
+//         7. On success: streams or returns JSON with dialled model id on every chunk/response
+//         8. If all fail: returns 502 with upstream failure trail in x-makefun-upstream-failures header
+//
 // THE MODEL RULE
 //   Whatever this server reports in a response's `model` field must be the model it actually dialled.
 //   The house records every gateway call and scores the model that really answered. This starter sends
@@ -95,7 +112,18 @@ const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** Cooldown duration after a 429, in milliseconds (60 seconds). */
 const COOLDOWN_MS = 60_000;
-/** Base delay between failover attempts, in milliseconds. */
+/**
+ * Base delay between failover attempts, in milliseconds.
+ *
+ * When a gateway call fails with a retryable error (network error, 429, 5xx, or 4xx except 429),
+ * serveWithFailover waits this many milliseconds before trying the next eligible model. This
+ * constant is referenced in two places in the retry loop:
+ *   1. After a network error (catch block around dial())
+ *   2. After a retryable/client HTTP error (isRetryableError || isClientError)
+ * The delay prevents hammering the gateway and gives transient errors a moment to clear.
+ * It is intentionally small (100ms) because the per-model cooldown (COOLDOWN_MS = 60s) handles
+ * sustained rate limits, while this delay only spaces immediate retries across different models.
+ */
 const FAILOVER_BASE_DELAY_MS = 100;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -131,7 +159,8 @@ function servedModels(): ServedModel[] {
 
 /**
  * Get eligible models for a requirement, sorted by rating_milli descending.
- * Skips models that are currently cooling down.
+ * Skips models that are currently cooling down (recently returned 429).
+ * This is the quality ranking: highest-rated eligible model is tried first.
  */
 function eligibleModels(requires: Requirement): ModelRow[] {
   const now = Date.now();
@@ -146,7 +175,11 @@ function eligibleModels(requires: Requirement): ModelRow[] {
   return eligible;
 }
 
-/** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
+/**
+ * The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own.
+ * The brief's prompts array is the declared source of each request's requirements; the fallback
+ * reads tools/vision/json from the request body when the brief has no row for it.
+ */
 function requirementsFor(body: Json): Requirement {
   const entry = brief.prompts[manifestIndex];
   manifestIndex += 1;
@@ -248,6 +281,15 @@ function sleep(ms: number): Promise<void> {
  * Try to serve a request with failover across eligible models.
  * Returns the successful response or null if all models failed.
  * Also returns the trail of upstream failures for the x-makefun-upstream-failures header.
+ *
+ * Failover logic:
+ * - Iterates eligible models sorted by rating_milli descending
+ * - On network error: logs trail, sleeps FAILOVER_BASE_DELAY_MS, tries next
+ * - On HTTP error (4xx/5xx): extracts error code, logs trail
+ *   - 429: records cooldown for this model
+ *   - retryable (429 or 5xx) or client error (4xx except 429): sleeps FAILOVER_BASE_DELAY_MS, tries next
+ * - On success: streams or returns JSON with dialled model id, returns success
+ * - If all exhausted: returns failure with full trail
  */
 async function serveWithFailover(
   wire: 'openai' | 'anthropic',
@@ -268,6 +310,7 @@ async function serveWithFailover(
       upstream = await dial(model.id, translate(body, model.id));
     } catch (err) {
       trail.push({ status: 0, code: 'network_error', model: model.id });
+      // Network-level failure (DNS, connection refused, timeout): brief pause before next model
       if (i + 1 < models.length) await sleep(FAILOVER_BASE_DELAY_MS);
       continue;
     }
@@ -291,6 +334,7 @@ async function serveWithFailover(
       }
 
       if (isRetryableError(status) || isClientError(status)) {
+        // Retryable (429/5xx) or client error (4xx except 429): brief pause before next model
         if (i + 1 < models.length) await sleep(FAILOVER_BASE_DELAY_MS);
         continue;
       }

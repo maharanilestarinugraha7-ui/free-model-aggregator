@@ -9,8 +9,8 @@
 //     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
 //     free model may serve a prompt; this baseline never routes a paid one.
 //   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
-//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its
-//     weight (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
+//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its weight
+//     (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
 //     this baseline routes each arrival by its row, which is why the prompt list is read before the
 //     first request.
 //
@@ -20,6 +20,24 @@
 //
 // Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
 // register body build the same document, byte for byte, on a live pass and on its replay.
+//
+// The 14 free models in the brief's catalog, each with its gateway id, parameter count (where known),
+// and quality rating in milli-points (0-2000, higher is stronger). These are the exact ids that must
+// appear in the register body and in GET /v1/models on both auth headers.
+//   - openrouter/baidu/ernie-5.5-flash-preview:free          // ~1M ctx, tools, JSON;       rating 1150
+//   - openrouter/cohere/north-mini-code:free                 // 256k ctx, tools;             rating 1200
+//   - openrouter/dots-studio/dots-3-note-preview:free        // 512k ctx, tools, vision, JSON; rating 1150
+//   - openrouter/google/gemma-4-26b-a4b-it:free              // 262k ctx, tools, vision, JSON; rating 1150
+//   - openrouter/google/gemma-4-31b-it:free                  // 262k ctx, tools, vision, JSON; rating 1210
+//   - openrouter/inclusionai/ling-3.2-flash:free             // 1M ctx, tools, vision, JSON;   rating 1150
+//   - openrouter/liquid/lfm-3-1.7b:free                      // 262k ctx, tools, JSON;       rating 1150
+//   - openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free // 256k ctx, tools, vision; rating 1150
+//   - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free      // 1M ctx, tools;               rating 1285
+//   - openrouter/nvidia/nemotron-3.5-lightning:free          // 1M ctx, tools;               rating 1221
+//   - openrouter/nvidia/nemotron-3.5-super-vl:free           // 1M ctx, tools, vision, JSON;   rating 1303
+//   - openrouter/particle-ai/particle-1:free                 // 1M ctx, tools, vision, JSON;   rating 1150
+//   - openrouter/recursive/flint-v1.0:free                   // 262k ctx, tools, JSON;       rating 1150
+//   - openrouter/thinkingmachines/inkling-2-small:free       // 1M ctx, tools, vision;         rating 1475
 
 import { readFileSync } from 'node:fs';
 
@@ -105,7 +123,11 @@ export interface Capabilities {
   json: boolean | null;
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
+/**
+ * Extract every JSON object in `text` that carries a string `schema`, in the order they appear.
+ * This scans the brief's prose for embedded JSON documents; each document is identified by its
+ * `schema` field matching the contest's prefix. Returns an array of parsed objects.
+ */
 function documentsIn(text: string): Json[] {
   const out: Json[] = [];
   for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
@@ -121,7 +143,10 @@ function documentsIn(text: string): Json[] {
   return out;
 }
 
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
+/**
+ * Find the index of the `}` closing the object that opens at `start`, or -1.
+ * String contents are skipped so that braces inside strings don't confuse the parser.
+ */
 function objectEnd(text: string, start: number): number {
   let depth = 0;
   let inString = false;
@@ -153,8 +178,9 @@ function boolOrNull(v: unknown): boolean | null {
 }
 
 /**
- * The first document under this contest's prefix that carries one of `keys` as an array: the document
- * and the key it was found under. A brief that spells its lists in the sibling's names still reads.
+ * Find the first document under this contest's prefix that carries one of `keys` as an array.
+ * A brief that spells its lists in the sibling's names (`models`/`ratings`, `prompts`/`manifest`)
+ * still reads correctly. Returns the document and the key it was found under, or null.
  */
 function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: Json; key: string } | null {
   for (const doc of docs) {
@@ -166,10 +192,10 @@ function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: J
 }
 
 /**
- * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
- * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
- * spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free unless it
- * says `free: false`; a paid row is never routed.
+ * Parse one model row from the brief's array. The id is the row's `id`, or its `model` under the
+ * provider that names it: a row that gives the bare OpenRouter id (`vendor/model:free`) and names
+ * `openrouter` is routed as the gateway spells it (`openrouter/vendor/model:free`). The brief lists
+ * free models, so a row is free unless it says `free: false`; a paid row is never routed.
  */
 function modelOf(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
@@ -209,7 +235,12 @@ function promptOf(v: unknown): PromptRow | null {
   };
 }
 
-/** The brief at `path`, its two documents found under this contest's schema prefix. */
+/**
+ * Read the brief at `path`, extracting its two documents (models and prompts) found under this
+ * contest's schema prefix. Returns a Brief with the parsed arrays, or an error message if either
+ * document is missing or unreadable. This is the single source of truth for the model catalog and
+ * the prompt manifest that drives routing.
+ */
 export function readBrief(path: string): Brief {
   if (path === '') return { models: [], prompts: [], error: 'MAKEFUN_PROMPT_FILE is not set' };
   let text: string;
@@ -238,12 +269,19 @@ export function readBrief(path: string): Brief {
   return { models, prompts, error: null };
 }
 
-/** The models this entry may serve: the brief's free ones, in the brief's order. */
+/**
+ * Return the models this entry may serve: the brief's free ones, in the brief's order.
+ * This is the pool from which `eligibleModels` in main.ts selects candidates for each prompt.
+ */
 export function freeModels(brief: Brief): ModelRow[] {
   return brief.models.filter((m) => m.free);
 }
 
-/** What a model can do, as the brief's row says it. */
+/**
+ * Extract a model's capabilities as a Capabilities struct, used by `meetsRequirements` to test
+ * whether the model can satisfy a prompt's needs. Null fields mean the brief did not declare
+ * that capability, and `meetsRequirements` treats unknown as absent.
+ */
 export function capabilitiesOf(model: ModelRow): Capabilities {
   return {
     context_length: model.context_length,
@@ -253,7 +291,11 @@ export function capabilitiesOf(model: ModelRow): Capabilities {
   };
 }
 
-/** Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one. */
+/**
+ * Test whether a model's capabilities meet one prompt's requirements. An unknown capability (null)
+ * never meets a required one. Checks tools, vision, JSON mode, and minimum context length.
+ * This is the gate that filters the free model pool before ranking by rating_milli.
+ */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
   if (requires.tools === true && caps.tools !== true) return false;
   if (requires.vision === true && caps.vision !== true) return false;
@@ -263,13 +305,12 @@ export function meetsRequirements(requires: Requirement, caps: Capabilities): bo
 }
 
 /**
- * The catalog the brief's free model list makes: one provider, the models it serves.
+ * Build the catalog the brief's free model list makes: one provider (openrouter), the models it
+ * serves. The base_url is the provider's public endpoint, never the gateway's trial-local address:
+ * the gateway's origin differs between a live pass and its replay, and the catalog is part of the
+ * state export a replay must reproduce byte for byte.
  *
- * The base_url is the provider's public endpoint, never the gateway's trial-local address: the gateway's
- * origin differs between a live pass and its replay, and the catalog is part of the state export a
- * replay must reproduce byte for byte.
- *
- * This baseline lists every free model in the brief — exactly the fourteen dialable ids the catalog
+ * This function lists every free model in the brief — exactly the fourteen dialable ids the catalog
  * column scores — so keep it that way: register this set and keep GET /v1/models (both auth headers)
  * exactly that set, since listing fewer loses the column as surely as listing more.
  */

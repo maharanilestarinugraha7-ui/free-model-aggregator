@@ -24,6 +24,19 @@
 // randomness, so the same body and the same gateway answer give the same bytes on a replay. The two
 // model listings use fixed timestamps for the same reason: a `created` that moved between runs would be
 // a nondeterministic document.
+//
+// SSE FRAMING NOTES:
+//   - Upstream Chat Completions streams are SSE: each frame ends with a blank line (`\n\n`).
+//   - `frameWithModel` splits on `\n\n`, parses each `data:` line's JSON payload, injects the dialled
+//     model id into the chunk object, and reassembles the frame with its terminating blank line.
+//   - Comments, `event:` lines, and non-JSON payloads (like `[DONE]`) pass through untouched.
+//   - `openAIStreamWithModel` reads the upstream ReadableStream, buffers across reads, splits frames on
+//     `\n\n`, yields each rewritten frame, and flushes any trailing buffer at end.
+//   - `anthropicEventsFromOpenAI` consumes the same upstream SSE, but translates each chunk into the
+//     Anthropic Messages event sequence: message_start on first chunk, content_block_start/delta/stop
+//     per text block or tool call, message_delta with stop_reason and usage, then message_stop.
+//   - It holds the stop_reason from the first finish_reason until the usage chunk arrives (OpenAI sends
+//     usage after finish_reason), then emits message_delta with output_tokens before message_stop.
 
 import { isRecord, type Json } from './providers.ts';
 
@@ -39,7 +52,10 @@ const FIXED_OPENAI_CREATED = 1767225600;
 /** A fixed instant for every listed model's `created_at`: nothing in the reply reads the clock. */
 const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
 
-/** GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape. */
+/**
+ * Build the OpenAI-shaped model list response for GET /v1/models (Authorization header).
+ * Returns `{ object: 'list', data: [{ id, object: 'model', created, owned_by }, ...] }`.
+ */
 export function openAIModelList(models: readonly ServedModel[]): Json {
   return {
     object: 'list',
@@ -47,7 +63,10 @@ export function openAIModelList(models: readonly ServedModel[]): Json {
   };
 }
 
-/** GET /v1/models on an Anthropic-shaped request (an x-api-key header): Anthropic's model list shape. */
+/**
+ * Build the Anthropic-shaped model list response for GET /v1/models (x-api-key header).
+ * Returns `{ data: [{ type: 'model', id, display_name, created_at }, ...], has_more: false }`.
+ */
 export function anthropicModelList(models: readonly ServedModel[]): Json {
   return {
     data: models.map((m) => ({ type: 'model', id: m.id, display_name: m.display_name, created_at: FIXED_ANTHROPIC_CREATED_AT })),
@@ -65,14 +84,17 @@ export function openAIError(message: string, type: string, code: string | null):
   return { error: { message, type, code } };
 }
 
-/** The text of a string or of a block array's text blocks; '' when there is none. */
+/** Extract text from a string or a block array's text blocks; returns '' when there is none. */
 function textOf(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
 }
 
-/** One Anthropic content block as an OpenAI content part: text or an inline image; null for the rest. */
+/**
+ * Convert one Anthropic content block to an OpenAI content part: text or an inline image (data URL).
+ * Returns null for unsupported block types (tool_use, tool_result, etc.).
+ */
 function partOf(block: Json): Json | null {
   if (block.type === 'text' && typeof block.text === 'string') return { type: 'text', text: block.text };
   if (block.type === 'image' && isRecord(block.source)) {
@@ -86,7 +108,10 @@ function partOf(block: Json): Json | null {
   return null;
 }
 
-/** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
+/**
+ * Convert a tool_result block's content to text: its text blocks, or JSON stringified when it holds
+ * something else. Used when rewriting Anthropic tool_result -> OpenAI tool message.
+ */
 function toolResultText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -96,7 +121,10 @@ function toolResultText(content: unknown): string {
   return content === undefined ? '' : JSON.stringify(content);
 }
 
-/** A tool call's arguments as an object: the gateway's JSON string, or {} when it is not one. */
+/**
+ * Parse a tool call's arguments as an object: the gateway's JSON string, or {} when it is not one.
+ * Handles both pre-parsed objects and JSON strings from the upstream.
+ */
 function argumentsOf(value: unknown): Json {
   if (isRecord(value)) return value;
   if (typeof value === 'string' && value.trim() !== '') {
@@ -110,7 +138,7 @@ function argumentsOf(value: unknown): Json {
   return {};
 }
 
-/** OpenAI's finish_reason as Anthropic's stop_reason. */
+/** Map OpenAI's finish_reason to Anthropic's stop_reason. */
 export function stopReasonOf(finish: unknown): string {
   if (finish === 'length') return 'max_tokens';
   if (finish === 'tool_calls' || finish === 'function_call') return 'tool_use';
@@ -119,10 +147,13 @@ export function stopReasonOf(finish: unknown): string {
 }
 
 /**
- * An Anthropic Messages request as an OpenAI Chat Completions request that names `model`: the system
- * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
- * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
- * output cap, temperature, top_p, stop sequences and streaming pass through.
+ * Translate an Anthropic Messages request to an OpenAI Chat Completions request that names `model`.
+ * - system prompt becomes a system message
+ * - image blocks become image_url data URLs
+ * - tool_use blocks become tool_calls
+ * - tool_result blocks become tool messages
+ * - tools and tool_choice are rewritten to OpenAI's function calling format
+ * - max_tokens, temperature, top_p, stop_sequences, and streaming pass through
  */
 export function anthropicToOpenAI(body: Json, model: string): Json {
   const messages: Json[] = [];
@@ -214,7 +245,11 @@ function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-/** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
+/**
+ * Translate a Chat Completions answer to an Anthropic Messages object. `model` is the id the entry
+ * dialled. Extracts text content and tool_calls -> tool_use blocks, maps finish_reason to stop_reason,
+ * and converts usage.prompt_tokens/completion_tokens to input_tokens/output_tokens.
+ */
 export function openAIToAnthropic(body: Json, model: string): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
   const choice = isRecord(choices[0]) ? choices[0] : {};
@@ -246,20 +281,27 @@ export function openAIToAnthropic(body: Json, model: string): Json {
   };
 }
 
-/** A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim. */
+/**
+ * Return a Chat Completions answer with `model` set to the id the entry dialled: the one truthful
+ * claim. The gateway's answer may name the model without the `openrouter/` prefix; this restores it.
+ */
 export function openAIJsonWithModel(body: Json, model: string): Json {
   return { ...body, model };
 }
 
-/** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
+/**
+ * Build one server-sent event string: `event: <name>\n` when named, then `data: <json>\n\n`.
+ * The blank line terminates the event per the SSE spec.
+ */
 export function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
 }
 
 /**
- * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
- * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
- * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
+ * Rewrite one SSE frame so every data payload's `model` is set to `model`, keeping its blank line.
+ * Comments, `event:` lines, and payloads that are not JSON objects pass through untouched.
+ * Chat Completions names the model on its chunks; the client sees the id the entry dialled, never
+ * the provider's spelling.
  */
 function frameWithModel(frame: string, model: string): string {
   const lines = frame.split('\n').map((line) => {
@@ -279,9 +321,10 @@ function frameWithModel(frame: string, model: string): string {
 }
 
 /**
- * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
- * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
- * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
+ * Consume a Chat Completions SSE stream from upstream, frame by frame, rewriting every data
+ * payload's `model` to the id the entry dialled. Frames are split on the blank line that ends
+ * them, as the SSE grammar does; a frame cut across reads is held until its end arrives, and a
+ * body that ends without one is relayed as it is. Yields rewritten frames as strings.
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -308,9 +351,12 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
 }
 
 /**
- * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the first chunk,
- * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason and
- * usage, then message_stop. `model` is the id the entry dialled, named back to the client.
+ * Consume a Chat Completions SSE stream from upstream and yield the Anthropic Messages event
+ * sequence: message_start on the first chunk, content_block_start/delta/stop per text block or
+ * tool call, then message_delta with the stop reason and usage, then message_stop. `model` is the
+ * id the entry dialled, named back to the client. The stop reason from the first finish_reason is
+ * held until the stream's usage chunk arrives (OpenAI sends usage after finish_reason), and
+ * message_delta carries the output_tokens before message_stop.
  */
 export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
@@ -365,7 +411,10 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     ];
   };
 
-  /** One SSE frame's lines as Anthropic events, mutating the stream's state. */
+  /**
+   * Convert one SSE frame's lines to Anthropic events, mutating the stream's state (indices,
+   * token counts, pending stop reason). Skips non-data lines and non-JSON payloads.
+   */
   const eventsOfFrame = (frame: string): string[] => {
     const out: string[] = [];
     for (const line of frame.split('\n')) {
@@ -432,8 +481,8 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
           out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
         }
       }
-      // Hold the stop reason until the stream's last chunk (the usage one) and [DONE] have arrived: OpenAI
-      // sends the usage after the finish_reason, and Anthropic's message_delta carries the output tokens.
+      // Hold the stop reason until the stream's last chunk (the usage one) and [DONE] have arrived:
+      // OpenAI sends the usage after the finish_reason, and Anthropic's message_delta carries the output tokens.
       if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
     }
     return out;
