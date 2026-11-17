@@ -268,8 +268,26 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
   const decoder = new TextDecoder();
   let buffer = '';
   let finishEmitted = false;
-  
-  function processFrame(frame: string): string {
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        yield processFrame(frame, model);
+        at = buffer.indexOf('\n\n');
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim() !== '') yield processFrame(buffer, model);
+  } finally {
+    reader.releaseLock();
+  }
+
+  function processFrame(frame: string, model: string): string {
     const lines = frame.split('\n').map((line) => {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) return line;
@@ -298,25 +316,6 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       return line;
     });
     return `${lines.join('\n')}\n\n`;
-  }
-
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        yield processFrame(frame);
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') yield processFrame(buffer);
-  } finally {
-    reader.releaseLock();
   }
 }
 
