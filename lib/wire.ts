@@ -257,36 +257,17 @@ export function sseEvent(event: string | null, data: unknown): string {
 }
 
 /**
- * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
- * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
- * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
- */
-function frameWithModel(frame: string, model: string): string {
-  const lines = frame.split('\n').map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return line;
-    const payload = trimmed.slice(5).trim();
-    if (payload === '' || payload === '[DONE]') return line;
-    try {
-      const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
-    } catch {
-      // Not JSON: relay the line as it came.
-    }
-    return line;
-  });
-  return `${lines.join('\n')}\n\n`;
-}
-
-/**
  * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
  * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
  * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
+ * Deduplicates finish_reason: only the first chunk with a finish_reason keeps it; subsequent chunks
+ * (typically the usage chunk) have finish_reason removed to satisfy wire checks.
  */
 export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let finishEmitted = false;
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -296,14 +277,45 @@ export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array
       while (at !== -1) {
         const frame = buffer.slice(0, at);
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
+        yield processFrame(frame, model);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') yield processFrame(buffer, model);
   } finally {
     reader.releaseLock();
+  }
+
+  function processFrame(frame: string, model: string): string {
+    const lines = frame.split('\n').map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) return line;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '' || payload === '[DONE]') return line;
+      try {
+        const chunk: unknown = JSON.parse(payload);
+        if (isRecord(chunk)) {
+          const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+          const choice = isRecord(choices[0]) ? choices[0] : {};
+          const finishReason = choice.finish_reason;
+          if (finishReason !== null && finishReason !== undefined) {
+            if (finishEmitted) {
+              // Remove finish_reason from this chunk (typically the usage chunk)
+              const newChoice = { ...choice, finish_reason: null };
+              const newChoices = choices.map((c, i) => i === 0 ? newChoice : c);
+              return `data: ${JSON.stringify({ ...chunk, model, choices: newChoices })}`;
+            }
+            finishEmitted = true;
+          }
+          return `data: ${JSON.stringify({ ...chunk, model })}`;
+        }
+      } catch {
+        // Not JSON: relay the line as it came.
+      }
+      return line;
+    });
+    return `${lines.join('\n')}\n\n`;
   }
 }
 
