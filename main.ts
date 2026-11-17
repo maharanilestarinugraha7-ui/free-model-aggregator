@@ -45,7 +45,7 @@
 //     candidates by rating_milli at the prompt's requirements and prefer the best.
 //   - failover (10%): a gateway call answered with a 4xx or a 5xx becomes a 502 to the client, and that
 //     prompt is lost. TODO(failover): retry the prompt on the next free model that meets it, and count
-//     every call it costs, because the tie-break is the number of gateway calls.
+//     every call it costs.
 //   - rate limits: after a 429 it keeps picking the same first model, so one rate-limited model takes
 //     every later prompt down with it. TODO(cooldowns): track each model's refusals and back off per
 //     model, and never spend a call on a model that is cooling down.
@@ -93,6 +93,8 @@ const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this baseline reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** Cooldown duration after a 429, in milliseconds (60 seconds). */
+const COOLDOWN_MS = 60_000;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -104,6 +106,8 @@ const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
+/** Per-model cooldown timestamps: model id -> timestamp when cooldown expires. */
+const modelCooldowns = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -124,16 +128,20 @@ function servedModels(): ServedModel[] {
 }
 
 /**
- * The one free model that serves a request. TODO(quality): rank every free candidate that meets the
- * requirements by the brief's rating_milli (quality is 60% of the score) and prefer the best. This
- * baseline takes the first free model in the brief's order that meets the requirements.
+ * Get eligible models for a requirement, sorted by rating_milli descending.
+ * Skips models that are currently cooling down.
  */
-function routeFor(requires: Requirement): ModelRow | null {
+function eligibleModels(requires: Requirement): ModelRow[] {
+  const now = Date.now();
+  const eligible: ModelRow[] = [];
   for (const model of freeModels(brief)) {
     if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
-    return model;
+    const cooldownUntil = modelCooldowns.get(model.id) ?? 0;
+    if (cooldownUntil > now) continue;
+    eligible.push(model);
   }
-  return null;
+  eligible.sort((a, b) => b.rating_milli - a.rating_milli);
+  return eligible;
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -141,8 +149,6 @@ function requirementsFor(body: Json): Requirement {
   const entry = brief.prompts[manifestIndex];
   manifestIndex += 1;
   if (entry !== undefined) return entry.requires;
-  // TODO(workload): the brief's prompt list is the declared source of each request's requirements; this
-  // fallback is a guess for a brief that holds none.
   return requirementsFromBody(body);
 }
 
@@ -216,64 +222,135 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: numb
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the first free model that meets it. */
+/** Record a 429 cooldown for a model. */
+function recordCooldown(modelId: string): void {
+  modelCooldowns.set(modelId, Date.now() + COOLDOWN_MS);
+}
+
+/** Check if a response indicates a retryable error (429 or 5xx). */
+function isRetryableError(status: number): boolean {
+  return status === 429 || (status >= 500 && status < 600);
+}
+
+/** Check if a response indicates a client error that should trigger failover (4xx except 429). */
+function isClientError(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 429;
+}
+
+/**
+ * Try to serve a request with failover across eligible models.
+ * Returns the successful response or null if all models failed.
+ * Also returns the trail of upstream failures for the x-makefun-upstream-failures header.
+ */
+async function serveWithFailover(
+  wire: 'openai' | 'anthropic',
+  body: Json,
+  requires: Requirement,
+  translate: (body: Json, model: string) => Json,
+  streamHandler: (upstream: ReadableStream<Uint8Array>, model: string, res: ServerResponse) => Promise<void>,
+  jsonHandler: (answer: Json, model: string) => Json,
+  res: ServerResponse
+): Promise<{ success: boolean; trail: Array<{ status: number; code: string; model: string | null }> }> {
+  const models = eligibleModels(requires);
+  const trail: Array<{ status: number; code: string; model: string | null }> = [];
+
+  for (const model of models) {
+    let upstream: Response;
+    try {
+      upstream = await dial(model.id, translate(body, model.id));
+    } catch (err) {
+      trail.push({ status: 0, code: 'network_error', model: model.id });
+      continue;
+    }
+
+    if (!upstream.ok || upstream.body === null) {
+      const status = upstream.status;
+      const text = await upstream.text();
+      let code = 'unknown';
+      try {
+        const errJson = JSON.parse(text);
+        if (isRecord(errJson) && isRecord(errJson.error) && typeof errJson.error.code === 'string') {
+          code = errJson.error.code;
+        }
+      } catch {
+        // Ignore parse errors
+      }
+      trail.push({ status, code, model: model.id });
+
+      if (status === 429) {
+        recordCooldown(model.id);
+      }
+
+      if (isRetryableError(status) || isClientError(status)) {
+        continue;
+      }
+      continue;
+    }
+
+    if (body.stream === true) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      try {
+        await streamHandler(upstream.body, model.id, res);
+      } finally {
+        res.end();
+      }
+      return { success: true, trail };
+    }
+
+    const answer: unknown = await upstream.json();
+    sendJson(res, 200, jsonHandler(isRecord(answer) ? answer : {}, model.id));
+    return { success: true, trail };
+  }
+
+  return { success: false, trail };
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client, answered with failover. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, { ...body, model: route.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
+  const requires = requirementsFor(body);
+  const { success, trail } = await serveWithFailover(
+    'openai',
+    body,
+    requires,
+    (b, model) => ({ ...b, model }),
+    async (upstream, model, res) => {
+      for await (const frame of openAIStreamWithModel(upstream, model)) res.write(frame);
+    },
+    (answer, model) => openAIJsonWithModel(answer, model),
+    res
+  );
+
+  if (!success) {
+    refused(res, 'openai', 502, trail.map(t => `${t.status}:${t.code}`).join('; '));
+  } else if (trail.length > 0) {
+    res.setHeader('x-makefun-upstream-failures', JSON.stringify(trail.slice(-8)));
   }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'openai', upstream.status, await upstream.text());
-  }
-  if (body.stream === true) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    try {
-      for await (const frame of openAIStreamWithModel(upstream.body, route.id)) res.write(frame);
-    } finally {
-      res.end();
-    }
-    return;
-  }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, route.id));
 }
 
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
+/** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back with failover. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, anthropicToOpenAI(body, route.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
+  const requires = requirementsFor(body);
+  const { success, trail } = await serveWithFailover(
+    'anthropic',
+    body,
+    requires,
+    (b, model) => anthropicToOpenAI(b, model),
+    async (upstream, model, res) => {
+      for await (const event of anthropicEventsFromOpenAI(upstream, model)) res.write(event);
+    },
+    (answer, model) => openAIToAnthropic(answer, model),
+    res
+  );
+
+  if (!success) {
+    refused(res, 'anthropic', 502, trail.map(t => `${t.status}:${t.code}`).join('; '));
+  } else if (trail.length > 0) {
+    res.setHeader('x-makefun-upstream-failures', JSON.stringify(trail.slice(-8)));
   }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'anthropic', upstream.status, await upstream.text());
-  }
-  if (body.stream === true) {
-    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id)) res.write(event);
-    } finally {
-      res.end();
-    }
-    return;
-  }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, route.id));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -341,8 +418,6 @@ function poll(server: Server): void {
 async function start(): Promise<void> {
   if (brief.error !== null) log(brief.error);
   if (process.argv.includes('--list')) {
-    // The same document the register body carries, byte for byte: print the one built object and stop
-    // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
@@ -359,7 +434,6 @@ async function start(): Promise<void> {
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server has no port');
   const port = address.port;
-  // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
   log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
   await register(port, catalog);
