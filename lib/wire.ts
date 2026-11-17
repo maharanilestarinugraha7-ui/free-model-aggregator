@@ -1,3 +1,19 @@
+/*
+ * Two wire APIs, one model-serving path.
+ * The OpenAI client speaks POST /v1/chat/completions; the Anthropic client speaks POST /v1/messages.
+ * Both dial the same upstream gateway (an OpenAI-compatible Chat Completions endpoint).
+ * OpenAI requests pass through with the dialled model id injected into the body and every streamed chunk.
+ * Anthropic requests are rewritten to Chat Completions: system prompt, images, tools, and tool_choice included.
+ * Anthropic responses are rewritten back: JSON answer -> Messages object; SSE stream -> message_start,
+ * content_block_start/delta/stop per block, message_delta with stop_reason and usage, message_stop.
+ * SSE frames from upstream are split on blank lines; each data: payload is parsed, the model field
+ * replaced with the dialled id, and the frame reassembled. Non-JSON and comment lines pass through.
+ * The Anthropic stream translator holds the first finish_reason until the usage chunk arrives (OpenAI
+ * emits usage after finish_reason), then emits message_delta with output_tokens before message_stop.
+ * Tool calls become tool_use blocks with input_json_delta events; text becomes text_delta events.
+ * Every response and every streamed chunk carries the model id the entry dialled, never the provider's.
+ */
+
 // The client wires, the one upstream wire, and the model field.
 //
 // The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an Anthropic
