@@ -48,6 +48,23 @@
 //         7. On success: streams or returns JSON with dialled model id on every chunk/response
 //         8. If all fail: returns 502 with upstream failure trail in x-makefun-upstream-failures header
 //
+// REQUEST FLOW: GATEWAY TRIAL PROMPTS THROUGH FAILOVER
+//   A trial prompt arrives as either OpenAI (POST /v1/chat/completions, Authorization header) or
+//   Anthropic (POST /v1/messages, x-api-key header). The handle() router dispatches to chat() or
+//   messages(), which read the JSON body, determine the prompt's requirements (from the brief's
+//   manifest by arrival order, or inferred from the body), then call serveWithFailover(). That function
+//   builds the eligible model list by filtering freeModels(brief) through meetsRequirements() and
+//   excluding any model whose cooldown timestamp (modelCooldowns Map) exceeds Date.now(). The survivors
+//   are sorted by rating_milli descending so the highest-quality model is tried first. For each model
+//   in that order, dial() POSTs to the gateway's Chat Completions endpoint with the dialled model id.
+//   If the gateway returns 429, the model enters a COOLDOWN_MS cooldown and the loop advances to the
+//   next model after FAILOVER_BASE_DELAY_MS. If the gateway returns any other 4xx or 5xx, the loop
+//   also advances after FAILOVER_BASE_DELAY_MS. Network errors (DNS, connection refused, timeout) are
+//   caught and similarly retried on the next model. On the first successful response (2xx with a body),
+//   the stream or JSON is relayed back to the client with the dialled model id on every chunk. If
+//   all eligible models are exhausted, a 502 is returned with the failure trail in the
+//   x-makefun-upstream-failures header.
+//
 // THE MODEL RULE
 //   Whatever this server reports in a response's `model` field must be the model it actually dialled.
 //   The house records every gateway call and scores the model that really answered. This starter sends
@@ -110,7 +127,18 @@ const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this baseline reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** Cooldown duration after a 429, in milliseconds (60 seconds). */
+/**
+ * Cooldown duration after a 429 response, in milliseconds (60 seconds).
+ *
+ * When the gateway returns HTTP 429 (rate limit) for a model, that model's id is
+ * recorded in modelCooldowns with an expiry of Date.now() + COOLDOWN_MS. The
+ * eligibleModels() function checks this map and skips any model whose cooldown
+ * has not yet expired. This prevents hammering a rate-limited model and gives
+ * the upstream time to recover. The value is intentionally long (60s) because
+ * free model quotas on OpenRouter replenish slowly; a shorter cooldown would
+ * waste calls on models that will just 429 again. COOLDOWN_MS is referenced in
+ * recordCooldown() and consulted in eligibleModels() on every prompt.
+ */
 const COOLDOWN_MS = 60_000;
 /**
  * Base delay between failover attempts, in milliseconds.
@@ -161,6 +189,18 @@ function servedModels(): ServedModel[] {
  * Get eligible models for a requirement, sorted by rating_milli descending.
  * Skips models that are currently cooling down (recently returned 429).
  * This is the quality ranking: highest-rated eligible model is tried first.
+ *
+ * MODEL SELECTION AND RATING_MILLI ORDERING
+ *   The brief assigns each free model a rating_milli: an integer representing the model's published
+ *   quality score in milli-points (e.g., 8500 = 8.5/10). Higher rating_milli means better expected
+ *   output quality. The eligibleModels() function filters the brief's free models by the prompt's
+ *   requirements (tools, vision, JSON mode, context) and by cooldown status, then sorts the remaining
+ *   models by rating_milli DESCENDING. This ensures the highest-quality eligible model is attempted
+ *   first, maximizing the quality score (60% of the total). The sort is stable for equal ratings,
+ *   preserving the brief's original order as a tie-break. Models that are cooling down from a recent
+ *   429 are excluded entirely, so a rate-limited model never blocks a prompt even if it has the
+ *   highest rating. The result is a failover chain ordered by quality: try the best, then the next
+ *   best, and so on, until one succeeds or all are exhausted.
  */
 function eligibleModels(requires: Requirement): ModelRow[] {
   const now = Date.now();
@@ -171,6 +211,7 @@ function eligibleModels(requires: Requirement): ModelRow[] {
     if (cooldownUntil > now) continue;
     eligible.push(model);
   }
+  // Sort by rating_milli DESC so the highest-quality eligible model is tried first.
   eligible.sort((a, b) => b.rating_milli - a.rating_milli);
   return eligible;
 }
@@ -234,7 +275,9 @@ function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: nu
 /** GET /v1/models, in the shape of the auth header the client sent. */
 function models(req: IncomingMessage, res: ServerResponse): void {
   const list = servedModels();
+  // Anthropic clients authenticate with the `x-api-key` header; respond in Anthropic format.
   if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
+  // OpenAI clients authenticate with the `Authorization: Bearer <key>` header; respond in OpenAI format.
   else sendJson(res, 200, openAIModelList(list));
 }
 

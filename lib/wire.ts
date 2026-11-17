@@ -37,6 +37,20 @@
 //     per text block or tool call, message_delta with stop_reason and usage, then message_stop.
 //   - It holds the stop_reason from the first finish_reason until the usage chunk arrives (OpenAI sends
 //     usage after finish_reason), then emits message_delta with output_tokens before message_stop.
+//
+// ANTHROPIC SSE EVENT SEQUENCE (message_start -> content_block_delta -> message_delta -> message_stop):
+//   The Anthropic Messages streaming API emits a strict sequence of server-sent events. The first event
+//   is always `message_start`, carrying the message id, role, model, an empty content array, and initial
+//   usage with input_tokens from the prompt. Then for each content block (text or tool_use) the stream
+//   emits `content_block_start` with the block's type and empty initial fields, zero or more
+//   `content_block_delta` events (text_delta for text, input_json_delta for tool arguments), and a
+//   `content_block_stop`. When all blocks are closed, a `message_delta` event arrives with the
+//   stop_reason (end_turn, max_tokens, tool_use, refusal) and the final output_tokens in its usage
+//   object. Finally `message_stop` terminates the stream with no payload. This function builds that exact
+//   order by holding the stop reason from the first OpenAI finish_reason until the usage chunk arrives
+//   (OpenAI emits usage after finish_reason), then emitting message_delta with output_tokens before
+//   message_stop. Text blocks and tool_use blocks each get their own index and independent start/delta/
+//   stop lifecycle, with tool blocks closing any open text block first.
 
 import { isRecord, type Json } from './providers.ts';
 
@@ -74,14 +88,27 @@ export function anthropicModelList(models: readonly ServedModel[]): Json {
   };
 }
 
+/**
+ * Build a standardized request error JSON body with HTTP status and message.
+ * Both OpenAI and Anthropic error envelopes can be constructed from this.
+ * The status is the HTTP status code (e.g., 400, 429, 500, 502).
+ * The message is the human-readable error description.
+ * Returns a plain object suitable for either wire format's error constructor.
+ */
+export function buildRequestError(status: number, message: string): { status: number; message: string } {
+  return { status, message };
+}
+
 /** An error in Anthropic's shape (the Messages API's error envelope). */
 export function anthropicError(type: string, message: string): Json {
-  return { type: 'error', error: { type, message } };
+  const err = buildRequestError(400, message);
+  return { type: 'error', error: { type, message: err.message } };
 }
 
 /** An error in OpenAI's shape (Chat Completions). */
 export function openAIError(message: string, type: string, code: string | null): Json {
-  return { error: { message, type, code } };
+  const err = buildRequestError(400, message);
+  return { error: { message: err.message, type, code } };
 }
 
 /** Extract text from a string or a block array's text blocks; returns '' when there is none. */
