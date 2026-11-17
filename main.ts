@@ -95,8 +95,6 @@ const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** Cooldown duration after a 429, in milliseconds (60 seconds). */
 const COOLDOWN_MS = 60_000;
-/** Long cooldown for models that return 403/400 (permanent-ish failure), in milliseconds (1 hour). */
-const PERMANENT_COOLDOWN_MS = 60 * 60 * 1000;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -224,11 +222,9 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: numb
   }
 }
 
-/** Record a cooldown for a model. Uses permanent cooldown for 403/400 errors. */
-function recordCooldown(modelId: string, status: number): void {
-  const isPermanent = status === 403 || (status >= 400 && status < 500 && status !== 429);
-  const cooldownMs = isPermanent ? PERMANENT_COOLDOWN_MS : COOLDOWN_MS;
-  modelCooldowns.set(modelId, Date.now() + cooldownMs);
+/** Record a 429 cooldown for a model. */
+function recordCooldown(modelId: string): void {
+  modelCooldowns.set(modelId, Date.now() + COOLDOWN_MS);
 }
 
 /** Check if a response indicates a retryable error (429 or 5xx). */
@@ -281,7 +277,9 @@ async function serveWithFailover(
       }
       trail.push({ status, code, model: model.id });
 
-      recordCooldown(model.id, status);
+      if (status === 429) {
+        recordCooldown(model.id);
+      }
 
       if (isRetryableError(status) || isClientError(status)) {
         continue;
